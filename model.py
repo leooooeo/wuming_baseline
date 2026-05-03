@@ -16,6 +16,9 @@ class ModelInput(NamedTuple):
     seq_data: dict  # {domain: tensor [B, S, L]}
     seq_lens: dict  # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    seq_ts_float_feats: dict  # {domain: tensor [B, 5, L]} per-position time floats
+    sample_timestamp: torch.Tensor  # (B,) int64 unix ts of the sample
+    seq_event_ts: dict  # {domain: tensor [B, L]} int64 unix ts per seq slot, 0=padding
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -433,6 +436,11 @@ class MultiSeqQueryGenerator(nn.Module):
         Q_i = [FFN_{i,1}(GlobalInfo_i), ..., FFN_{i,N}(GlobalInfo_i)]
     """
 
+    # Per-sequence time-statistics dimension: 3 (max/min/mean of log1p(time_diff))
+    # + 3 (log1p of #events within 15min/1h/1day). Per-sequence global summary
+    # of the temporal distribution of seq events relative to the sample ts.
+    TIME_STATS_DIM: int = 6
+
     def __init__(
         self,
         d_model: int,
@@ -446,10 +454,22 @@ class MultiSeqQueryGenerator(nn.Module):
         self.num_sequences = num_sequences
         self.d_model = d_model
 
-        global_info_dim = (num_ns + 1) * d_model
+        # global_info = [ns_flat | seq_pooled | time_stats_token]  -> (M+2)*D
+        global_info_dim = (num_ns + 2) * d_model
 
         # LayerNorm on global_info to prevent gradient explosion from large-dim concat
         self.global_info_norm = nn.LayerNorm(global_info_dim)
+
+        # Per-sequence projection for the 6-dim time-stats vector -> D-dim token.
+        self.time_stats_projs = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(self.TIME_STATS_DIM, d_model),
+                    nn.LayerNorm(d_model),
+                )
+                for _ in range(num_sequences)
+            ]
+        )
 
         # Each sequence has N independent FFNs
         self.query_ffns_per_seq = nn.ModuleList(
@@ -469,8 +489,60 @@ class MultiSeqQueryGenerator(nn.Module):
             ]
         )
 
+    @staticmethod
+    def _compute_time_stats(
+        event_ts: torch.Tensor, sample_ts: torch.Tensor
+    ) -> torch.Tensor:
+        """Per-sequence temporal summary used as a query-side context token.
+
+        Returns ``(B, 6)``:
+          0..2: max / min / mean of ``log1p(sample_ts - event_ts)`` over valid slots
+          3..5: ``log1p(#events)`` with time_diff <= 15min / 1h / 1day
+
+        ``event_ts == 0`` denotes padding and is excluded from every reduction.
+        Rows with no valid events get all zeros (no signal).
+        """
+        valid = event_ts > 0  # (B, L)
+        # fp32 arithmetic to avoid bf16 precision loss on Unix timestamps.
+        diff = (sample_ts.unsqueeze(1) - event_ts).clamp(min=0).to(torch.float32)
+        log_diff = torch.log1p(diff)  # (B, L)
+
+        valid_f = valid.to(torch.float32)
+        valid_count = valid_f.sum(dim=1).clamp(min=1.0)
+        no_valid = ~valid.any(dim=1)
+
+        log_max = log_diff.masked_fill(~valid, float("-inf")).amax(dim=1)
+        log_min = log_diff.masked_fill(~valid, float("inf")).amin(dim=1)
+        log_mean = (log_diff * valid_f).sum(dim=1) / valid_count
+
+        zero = torch.zeros_like(log_max)
+        log_max = torch.where(no_valid, zero, log_max)
+        log_min = torch.where(no_valid, zero, log_min)
+        log_mean = torch.where(no_valid, zero, log_mean)
+
+        cnt_15min = ((diff <= 900.0) & valid).to(torch.float32).sum(dim=1)
+        cnt_1h = ((diff <= 3600.0) & valid).to(torch.float32).sum(dim=1)
+        cnt_1d = ((diff <= 86400.0) & valid).to(torch.float32).sum(dim=1)
+
+        return torch.stack(
+            [
+                log_max,
+                log_min,
+                log_mean,
+                torch.log1p(cnt_15min),
+                torch.log1p(cnt_1h),
+                torch.log1p(cnt_1d),
+            ],
+            dim=-1,
+        )
+
     def forward(
-        self, ns_tokens: torch.Tensor, seq_tokens_list: list, seq_padding_masks: list
+        self,
+        ns_tokens: torch.Tensor,
+        seq_tokens_list: list,
+        seq_padding_masks: list,
+        seq_event_ts_list: List[torch.Tensor],
+        sample_timestamp: torch.Tensor,
     ) -> list:
         """Generates query tokens for each sequence.
 
@@ -479,6 +551,9 @@ class MultiSeqQueryGenerator(nn.Module):
             seq_tokens_list: List of (B, L_i, D) tensors, length S.
             seq_padding_masks: List of (B, L_i) masks, length S. True
                 indicates padding.
+            seq_event_ts_list: List of (B, L_i) int64 tensors, length S.
+                Raw Unix timestamps per sequence slot (0 = padding).
+            sample_timestamp: (B,) int64 sample-level Unix timestamp.
 
         Returns:
             List of (B, Nq, D) query token tensors, length S.
@@ -495,8 +570,16 @@ class MultiSeqQueryGenerator(nn.Module):
             seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
             seq_pooled = seq_sum / seq_count  # (B, D)
 
-            # GlobalInfo_i = Concat(NS_flat, seq_pooled_i)
-            global_info = torch.cat([ns_flat, seq_pooled], dim=-1)  # (B, (M+1)*D)
+            # Per-sequence temporal summary token (sequence-level time context).
+            time_stats = self._compute_time_stats(
+                seq_event_ts_list[i], sample_timestamp
+            )  # (B, 6)
+            time_stats_token = self.time_stats_projs[i](time_stats)  # (B, D)
+
+            # GlobalInfo_i = Concat(NS_flat, seq_pooled_i, time_stats_token_i)
+            global_info = torch.cat(
+                [ns_flat, seq_pooled, time_stats_token], dim=-1
+            )  # (B, (M+2)*D)
             global_info = self.global_info_norm(global_info)
 
             # Generate N query tokens
@@ -1916,7 +1999,14 @@ class PCVRHyFormer(nn.Module):
             seq_masks_list.append(mask)
 
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        seq_event_ts_list = [inputs.seq_event_ts[d] for d in self.seq_domains]
+        q_tokens_list = self.query_generator(
+            ns_tokens,
+            seq_tokens_list,
+            seq_masks_list,
+            seq_event_ts_list=seq_event_ts_list,
+            sample_timestamp=inputs.sample_timestamp,
+        )
 
         # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
         output = self._run_multi_seq_blocks(
@@ -1976,7 +2066,14 @@ class PCVRHyFormer(nn.Module):
             )
             seq_masks_list.append(mask)
 
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        seq_event_ts_list = [inputs.seq_event_ts[d] for d in self.seq_domains]
+        q_tokens_list = self.query_generator(
+            ns_tokens,
+            seq_tokens_list,
+            seq_masks_list,
+            seq_event_ts_list=seq_event_ts_list,
+            sample_timestamp=inputs.sample_timestamp,
+        )
 
         output = self._run_multi_seq_blocks(
             q_tokens_list,
